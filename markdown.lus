@@ -75,7 +75,7 @@ local function safe_dest(dest, image)
 end
 
 -- Entities that decode inside link destinations and titles.
-local ENTITIES = { amp = "&", lt = "<", gt = ">", quot = '"', apos = "'", nbsp = "\u{A0}", copy = "©", reg = "®", hellip = "…", mdash = "—", ndash = "–" }
+local ENTITIES = { amp = "&", lt = "<", gt = ">", quot = '"', apos = "'", nbsp = "\u{A0}", copy = "©", reg = "®", hellip = "…", mdash = "\u{2014}", ndash = "\u{2013}" }
 
 local function decode_entities(s)
     return (s:gsub("&(#?[%w]+);", function(name)
