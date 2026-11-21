@@ -1,0 +1,1328 @@
+--- Renders CommonMark to HTML, with the GitHub extensions for tables,
+--- strikethrough, task lists, and autolinks.
+---
+--- `markdown.render` returns the HTML of a text. `markdown.parse` returns its
+--- syntax tree as nested tables, and `markdown.html` renders a tree, so a
+--- program can change the tree in between. Raw HTML in the input is escaped
+--- unless the `html` option is true.
+---
+--- @package markdown
+--- @version 0.1.0
+--- @lus 2.0
+--- @license 0BSD
+--- @repository https://github.com/lus-lang/atmos-markdown
+
+local M = {}
+
+-- Characters -------------------------------------------------------------------------
+
+local PUNCT = "[!\"#$%%&'()*+,%-./:;<=>?@%[\\%]^_`{|}~]"
+
+local function is_space(c)
+    return c == "" or c:match("^%s$") ~= nil or c == "\u{A0}"
+end
+
+local function is_punct(c)
+    return c ~= "" and c:match("^" .. PUNCT .. "$") ~= nil
+end
+
+local function escape_html(s)
+    return (s:gsub('[&<>"]', { ["&"] = "&amp;", ["<"] = "&lt;", [">"] = "&gt;", ['"'] = "&quot;" }))
+end
+
+local SAFE_URL = "[%w%-%._~:/%?#@!%$&'%(%)%*%+,;=%%]"
+
+local function encode_url(url)
+    local out = {}
+    for _, code in utf8.codes(url, true) do
+        local c = utf8.char(code)
+        if code < 128 and c:match("^" .. SAFE_URL .. "$") then
+            out[#out + 1] = c
+        else
+            local bytes = vector.fromstring(c)
+            for i = 0, #bytes - 1 do
+                out[#out + 1] = string.format("%%%02X", vector.get(bytes, i))
+            end
+        end
+    end
+    local s = table.concat(out)
+    -- A % that does not start an escape is encoded.
+    s = s:gsub("%%(%x?%x?)", function(h)
+        if #h == 2 then return "%" .. h end
+        return "%25" .. h
+    end)
+    return (s:gsub("&", "&amp;"):gsub('"', "&quot;"))
+end
+
+local UNSAFE_SCHEMES = { javascript = true, vbscript = true, file = true }
+
+local function safe_dest(dest, image)
+    local scheme = dest:match("^%s*([%a][%w+.%-]*):")
+    if scheme == nil then
+        return dest
+    end
+    scheme = scheme:lower()
+    if UNSAFE_SCHEMES[scheme] then
+        return ""
+    end
+    if scheme == "data" then
+        if image and dest:lower():match("^%s*data:image/[%a]+[;,]") and not dest:lower():match("^%s*data:image/svg") then
+            return dest
+        end
+        return ""
+    end
+    return dest
+end
+
+-- Entities that decode inside link destinations and titles.
+local ENTITIES = { amp = "&", lt = "<", gt = ">", quot = '"', apos = "'", nbsp = "\u{A0}", copy = "©", reg = "®", hellip = "…", mdash = "—", ndash = "–" }
+
+local function decode_entities(s)
+    return (s:gsub("&(#?[%w]+);", function(name)
+        local hex = name:match("^#[xX](%x+)$")
+        if hex then return utf8.char(math.min(tonumber(hex, 16), 0x10FFFF)) end
+        local dec = name:match("^#(%d+)$")
+        if dec then
+            local n = tonumber(dec)
+            if n == 0 or n > 0x10FFFF then n = 0xFFFD end
+            return utf8.char(n)
+        end
+        return ENTITIES[name]
+    end))
+end
+
+local function unescape_backslash(s)
+    return (s:gsub("\\(" .. PUNCT .. ")", "%1"))
+end
+
+local function normalize_label(s)
+    return s:gsub("%s+", " "):match("^%s*(.-)%s*$"):lower()
+end
+
+-- Inline parsing --------------------------------------------------------------------
+
+local function text_node(s)
+    return { type = "text", text = s }
+end
+
+-- Reads a link destination and title after "(" at position `pos` of `s`.
+-- Returns the destination, the title, and the position after ")", or nil.
+local function link_tail(s, pos)
+    local i = pos
+    i = i + #s:match("^[ \t]*\n?[ \t]*", i)
+    local dest
+    if s:sub(i, i) == "<" then
+        local close = i + 1
+        while close <= #s do
+            local c = s:sub(close, close)
+            if c == "\\" then
+                close = close + 2
+            elseif c == ">" then
+                break
+            elseif c == "<" or c == "\n" then
+                return nil
+            else
+                close = close + 1
+            end
+        end
+        if s:sub(close, close) ~= ">" then
+            return nil
+        end
+        dest = s:sub(i + 1, close - 1)
+        i = close + 1
+    else
+        local depth, j = 0, i
+        while j <= #s do
+            local c = s:sub(j, j)
+            if c == "\\" and is_punct(s:sub(j + 1, j + 1)) then
+                j = j + 2
+            elseif c == "(" then
+                depth = depth + 1
+                j = j + 1
+            elseif c == ")" then
+                if depth == 0 then break end
+                depth = depth - 1
+                j = j + 1
+            elseif c:match("[%s%c]") then
+                break
+            else
+                j = j + 1
+            end
+        end
+        if depth ~= 0 then
+            return nil
+        end
+        dest = s:sub(i, j - 1)
+        i = j
+    end
+    local title
+    local ws = s:match("^[ \t]*\n?[ \t]*", i)
+    local q = s:sub(i + #ws, i + #ws)
+    if #ws > 0 and (q == '"' or q == "'" or q == "(") then
+        local close_char = q == "(" and ")" or q
+        local j = i + #ws + 1
+        while j <= #s do
+            local c = s:sub(j, j)
+            if c == "\\" then
+                j = j + 2
+            elseif c == close_char then
+                break
+            elseif q == "(" and c == "(" then
+                return nil
+            else
+                j = j + 1
+            end
+        end
+        if s:sub(j, j) ~= close_char then
+            return nil
+        end
+        title = s:sub(i + #ws + 1, j - 1)
+        i = j + 1
+    end
+    i = i + #s:match("^[ \t]*\n?[ \t]*", i)
+    if s:sub(i, i) ~= ")" then
+        return nil
+    end
+    return unescape_backslash(decode_entities(dest)), title and unescape_backslash(decode_entities(title)), i + 1
+end
+
+-- Reads a link label "[...]" at position `pos`. Returns the label text and
+-- the position after "]", or nil.
+local function link_label(s, pos)
+    if s:sub(pos, pos) ~= "[" then
+        return nil
+    end
+    local j = pos + 1
+    while j <= #s do
+        local c = s:sub(j, j)
+        if c == "\\" then
+            j = j + 2
+        elseif c == "[" then
+            return nil
+        elseif c == "]" then
+            local label = s:sub(pos + 1, j - 1)
+            if #label > 999 or label:match("^%s*$") then
+                return nil
+            end
+            return label, j + 1
+        else
+            j = j + 1
+        end
+    end
+    return nil
+end
+
+-- Matches an inline HTML construct at `pos`. Returns its end position.
+local function html_inline_at(s, pos)
+    local rest = s:sub(pos)
+    local m = rest:match("^<[%a][%w%-]*[^<>]-/?>")
+    if m and not m:match("^<[%a][%w%-]*[^%s/>%w%-]") then
+        -- Attribute values must be balanced in quotes.
+        local _, dq = m:gsub('"', "")
+        local _, sq = m:gsub("'", "")
+        if dq % 2 == 0 and sq % 2 == 0 then
+            return pos + #m - 1
+        end
+    end
+    m = rest:match("^</[%a][%w%-]*%s*>")
+    if m then return pos + #m - 1 end
+    m = rest:match("^<!%-%-.-%-%->")
+    if m and not m:match("^<!%-%->") and not m:match("^<!%-%-%->") then return pos + #m - 1 end
+    m = rest:match("^<%?.-%?>")
+    if m then return pos + #m - 1 end
+    m = rest:match("^<![%a][^>]*>")
+    if m then return pos + #m - 1 end
+    m = rest:match("^<!%[CDATA%[.-%]%]>")
+    if m then return pos + #m - 1 end
+    return nil
+end
+
+local function flanking(prev, nxt)
+    local left = not is_space(nxt) and (not is_punct(nxt) or is_space(prev) or is_punct(prev))
+    local right = not is_space(prev) and (not is_punct(prev) or is_space(nxt) or is_punct(nxt))
+    return left, right
+end
+
+-- Character before position `i` and after position `j` of `s`, as whole
+-- characters.
+local function char_before(s, i)
+    if i <= 1 then return "" end
+    return s:sub(i - 1, i - 1)
+end
+
+local function char_after(s, j)
+    return s:sub(j + 1, j + 1)
+end
+
+local parse_inlines
+
+-- Runs the emphasis algorithm of CommonMark over `nodes` for the delimiters
+-- above `bottom` in `delims`.
+local function process_emphasis(nodes, delims, bottom)
+    local function index_of(node)
+        for i, n in ipairs(nodes) do
+            if n == node then return i end
+        end
+    end
+    local ci = bottom + 1
+    while ci <= #delims do
+        local closer = delims[ci]
+        if closer.can_close and closer.count > 0 then
+            local oi = ci - 1
+            local opener
+            while oi > bottom do
+                local d = delims[oi]
+                if d.char == closer.char and d.can_open and d.count > 0 then
+                    local odd = (d.can_close or closer.can_open) and (d.orig + closer.orig) % 3 == 0
+                        and not (d.orig % 3 == 0 and closer.orig % 3 == 0)
+                    if closer.char == "~" then
+                        if d.count == closer.count then
+                            opener = d
+                            break
+                        end
+                    elseif not odd then
+                        opener = d
+                        break
+                    end
+                end
+                oi = oi - 1
+            end
+            if opener then
+                local use
+                local kind
+                if closer.char == "~" then
+                    use, kind = closer.count, "strikethrough"
+                else
+                    use = (closer.count >= 2 and opener.count >= 2) and 2 or 1
+                    kind = use == 2 and "strong" or "emph"
+                end
+                opener.count = opener.count - use
+                closer.count = closer.count - use
+                opener.node.text = opener.node.text:sub(1, opener.count)
+                closer.node.text = closer.node.text:sub(1, closer.count)
+                local a, b = index_of(opener.node), index_of(closer.node)
+                local children = {}
+                for k = a + 1, b - 1 do
+                    children[#children + 1] = nodes[k]
+                end
+                for _ = a + 1, b - 1 do
+                    table.remove(nodes, a + 1)
+                end
+                table.insert(nodes, a + 1, { type = kind, children = children })
+                -- Delimiters between the opener and the closer are gone.
+                for _ = oi + 1, ci - 1 do
+                    table.remove(delims, oi + 1)
+                end
+                ci = oi + 1
+                if opener.count == 0 then
+                    table.remove(nodes, index_of(opener.node))
+                    table.remove(delims, oi)
+                    ci = ci - 1
+                end
+                if closer.count == 0 then
+                    table.remove(nodes, index_of(closer.node))
+                    table.remove(delims, ci)
+                end
+            else
+                if not closer.can_open then
+                    table.remove(delims, ci)
+                else
+                    ci = ci + 1
+                end
+            end
+        else
+            ci = ci + 1
+        end
+    end
+    -- What remains is plain text.
+    for k = #delims, bottom + 1, -1 do
+        table.remove(delims, k)
+    end
+end
+
+local AUTOLINK_URI = "^<([%a][%w+.%-]+:[^%s<>%c]*)>"
+
+parse_inlines = function(s, refs, opts)
+    local nodes = {}
+    local delims = {}
+    local brackets = {}
+    local buf = {}
+    local i, n = 1, #s
+    local function flush()
+        if #buf > 0 then
+            nodes[#nodes + 1] = text_node(table.concat(buf))
+            buf = {}
+        end
+    end
+    local function push(node)
+        flush()
+        nodes[#nodes + 1] = node
+    end
+    while i <= n do
+        local c = s:sub(i, i)
+        if c == "\\" then
+            local d = s:sub(i + 1, i + 1)
+            if d == "\n" then
+                push({ type = "linebreak" })
+                i = i + 2
+                i = i + #s:match("^[ \t]*", i)
+            elseif is_punct(d) then
+                buf[#buf + 1] = d
+                i = i + 2
+            else
+                buf[#buf + 1] = "\\"
+                i = i + 1
+            end
+        elseif c == "`" then
+            local run = s:match("^`+", i)
+            local j = i + #run
+            local close
+            while true do
+                local k = s:find("`+", j)
+                if k == nil then break end
+                local r = s:match("^`+", k)
+                if #r == #run then
+                    close = k
+                    break
+                end
+                j = k + #r
+            end
+            if close then
+                local code = s:sub(i + #run, close - 1):gsub("\n", " ")
+                if code:match("^ .* $") and not code:match("^ +$") then
+                    code = code:sub(2, -2)
+                end
+                push({ type = "code", text = code })
+                i = close + #run
+            else
+                buf[#buf + 1] = run
+                i = i + #run
+            end
+        elseif c == "*" or c == "_" or c == "~" then
+            local run = s:match("^%" .. c .. "+", i)
+            local prev, nxt = char_before(s, i), char_after(s, i + #run - 1)
+            local left, right = flanking(prev, nxt)
+            local can_open, can_close
+            if c == "_" then
+                can_open = left and (not right or is_punct(prev))
+                can_close = right and (not left or is_punct(nxt))
+            else
+                can_open, can_close = left, right
+            end
+            flush()
+            local node = text_node(run)
+            nodes[#nodes + 1] = node
+            if c ~= "~" or #run <= 2 then
+                delims[#delims + 1] = { node = node, char = c, count = #run, orig = #run, can_open = can_open, can_close = can_close }
+            end
+            i = i + #run
+        elseif c == "!" and s:sub(i + 1, i + 1) == "[" then
+            flush()
+            local node = text_node("![")
+            nodes[#nodes + 1] = node
+            brackets[#brackets + 1] = { node = node, image = true, delim_bottom = #delims, active = true, pos = i + 2 }
+            i = i + 2
+        elseif c == "[" then
+            flush()
+            local node = text_node("[")
+            nodes[#nodes + 1] = node
+            brackets[#brackets + 1] = { node = node, image = false, delim_bottom = #delims, active = true, pos = i + 1 }
+            i = i + 1
+        elseif c == "]" then
+            flush()
+            local opener = brackets[#brackets]
+            if opener == nil then
+                buf[#buf + 1] = "]"
+                i = i + 1
+            elseif not opener.active then
+                table.remove(brackets)
+                buf[#buf + 1] = "]"
+                i = i + 1
+            else
+                local dest, title, after
+                if s:sub(i + 1, i + 1) == "(" then
+                    dest, title, after = link_tail(s, i + 2)
+                end
+                if dest == nil then
+                    -- A reference: [text][label], [text][], or [text].
+                    local label, after_label = link_label(s, i + 1)
+                    local key
+                    if label then
+                        key = normalize_label(label)
+                        after = after_label
+                    elseif s:sub(i + 1, i + 2) == "[]" then
+                        key = normalize_label(s:sub(opener.pos, i - 1))
+                        after = i + 3
+                    else
+                        key = normalize_label(s:sub(opener.pos, i - 1))
+                        after = i + 1
+                    end
+                    local ref = refs[key]
+                    if ref then
+                        dest, title = ref.dest, ref.title
+                    else
+                        after = nil
+                    end
+                end
+                if dest then
+                    local start = nil
+                    for k, node in ipairs(nodes) do
+                        if node == opener.node then start = k break end
+                    end
+                    process_emphasis(nodes, delims, opener.delim_bottom)
+                    for k, node in ipairs(nodes) do
+                        if node == opener.node then start = k break end
+                    end
+                    local children = {}
+                    for k = start + 1, #nodes do
+                        children[#children + 1] = nodes[k]
+                    end
+                    for k = #nodes, start, -1 do
+                        nodes[k] = nil
+                    end
+                    nodes[#nodes + 1] = {
+                        type = opener.image and "image" or "link",
+                        dest = dest, title = title, children = children,
+                    }
+                    table.remove(brackets)
+                    if not opener.image then
+                        -- Links may not contain links.
+                        for _, b in ipairs(brackets) do
+                            if not b.image then b.active = false end
+                        end
+                    end
+                    i = after
+                else
+                    table.remove(brackets)
+                    buf[#buf + 1] = "]"
+                    i = i + 1
+                end
+            end
+        elseif c == "<" then
+            local uri = s:match(AUTOLINK_URI, i)
+            local email = not uri and s:match("^<([%w.!#$%%&'*+/=?^_`{|}~%-]+@[%w][%w%-]*[%.%w%-]*)>", i)
+            if uri then
+                push({ type = "link", dest = uri, children = { text_node(uri) }, autolink = true })
+                i = i + #uri + 2
+            elseif email then
+                push({ type = "link", dest = "mailto:" .. email, children = { text_node(email) }, autolink = true })
+                i = i + #email + 2
+            else
+                local stop = html_inline_at(s, i)
+                if stop then
+                    push({ type = "html_inline", text = s:sub(i, stop) })
+                    i = stop + 1
+                else
+                    buf[#buf + 1] = "<"
+                    i = i + 1
+                end
+            end
+        elseif c == "\n" then
+            -- Two spaces or more at the end of a line make a hard break.
+            local last = buf[#buf]
+            local trailing = 0
+            if last then
+                local joined = table.concat(buf)
+                local sp = joined:match(" *$")
+                trailing = #sp
+                buf = { joined:sub(1, #joined - #sp) }
+            end
+            if trailing >= 2 then
+                push({ type = "linebreak" })
+            else
+                push({ type = "softbreak" })
+            end
+            i = i + 1
+            i = i + #s:match("^ *", i)
+        elseif c == "&" then
+            local ent = s:match("^&#[xX]%x%x?%x?%x?%x?%x?;", i) or s:match("^&#%d%d?%d?%d?%d?%d?%d?;", i)
+                or s:match("^&[%a][%w]+;", i)
+            if ent then
+                local decoded = decode_entities(ent)
+                if decoded ~= ent then
+                    buf[#buf + 1] = decoded
+                else
+                    push({ type = "entity", text = ent })
+                end
+                i = i + #ent
+            else
+                buf[#buf + 1] = "&"
+                i = i + 1
+            end
+        elseif opts.autolinks and (c == "h" or c == "w") and (i == 1 or s:sub(i - 1, i - 1):match("[%s%*_~%(]")) then
+            local url = s:match("^https?://[%w%-]+[%.%w%-]*[^%s<]*", i) or s:match("^www%.[%w%-]+[%.%w%-]*[^%s<]*", i)
+            if url then
+                -- Trailing punctuation is not part of the link.
+                url = url:gsub("[%?!%.,:%*_~]+$", "")
+                local opens = select(2, url:gsub("%(", ""))
+                local closes = select(2, url:gsub("%)", ""))
+                while url:sub(-1) == ")" and closes > opens do
+                    url = url:sub(1, -2)
+                    closes = closes - 1
+                end
+                local entity = url:match("&%w+;$")
+                if entity then url = url:sub(1, #url - #entity) end
+                local dest = url:sub(1, 4) == "www." and "http://" .. url or url
+                push({ type = "link", dest = dest, children = { text_node(url) }, autolink = true })
+                i = i + #url
+            else
+                buf[#buf + 1] = c
+                i = i + 1
+            end
+        else
+            local plain = s:match("^[^\\`%*_~!%[%]<\n&hw]+", i)
+            if plain then
+                buf[#buf + 1] = plain
+                i = i + #plain
+            else
+                buf[#buf + 1] = c
+                i = i + 1
+            end
+        end
+    end
+    flush()
+    process_emphasis(nodes, delims, 0)
+    -- Trailing spaces of the paragraph go.
+    local last = nodes[#nodes]
+    if last and last.type == "text" then
+        last.text = last.text:gsub(" +$", "")
+    end
+    return nodes
+end
+
+-- Block parsing ------------------------------------------------------------------------
+
+-- Expands the tabs that take part in block structure: those of the
+-- indentation, and those after a list or quote marker at its start. Tabs
+-- inside the content stay, as CommonMark requires for code.
+local function expand_tabs(line)
+    if not line:find("\t", 1, true) then
+        return line
+    end
+    local out, col = {}, 0
+    local function spaces(ws)
+        for c in ws:gmatch(".") do
+            if c == "\t" then
+                local n = 4 - col % 4
+                out[#out + 1] = string.rep(" ", n)
+                col = col + n
+            else
+                out[#out + 1] = c
+                col = col + 1
+            end
+        end
+    end
+    local lead, rest = line:match("^([ \t]*)(.*)$")
+    spaces(lead)
+    local marker = rest:match("^[%-+*>]") or rest:match("^%d+[.)]")
+    while marker do
+        out[#out + 1] = marker
+        col = col + #marker
+        rest = rest:sub(#marker + 1)
+        local ws
+        ws, rest = rest:match("^([ \t]*)(.*)$")
+        if ws == "" then break end
+        spaces(ws)
+        marker = rest:match("^>")
+    end
+    out[#out + 1] = rest
+    return table.concat(out)
+end
+
+local function indent_of(line)
+    return #line:match("^ *")
+end
+
+local function is_blank(line)
+    return line:match("^[ \t]*$") ~= nil
+end
+
+local function thematic_break(line)
+    if indent_of(line) > 3 then return false end
+    local body = line:gsub("%s", "")
+    return #body >= 3 and (body:match("^%*+$") or body:match("^%-+$") or body:match("^_+$")) ~= nil
+end
+
+local function atx_heading(line)
+    local hashes, rest = line:match("^ ? ? ?(#+)(.*)$")
+    if hashes == nil or #hashes > 6 then return nil end
+    if rest ~= "" and not rest:match("^[ \t]") then return nil end
+    rest = rest:match("^%s*(.-)%s*$")
+    rest = rest:gsub("%s+#+$", ""):gsub("^#+$", "")
+    return #hashes, rest
+end
+
+local function fence_open(line)
+    local ind, fence, info = line:match("^( ? ? ?)(```+)([^`]*)$")
+    if fence == nil then
+        ind, fence, info = line:match("^( ? ? ?)(~~~+)(.*)$")
+    end
+    if fence == nil then return nil end
+    return #ind, fence, info:match("^%s*(.-)%s*$")
+end
+
+local function list_marker(line)
+    local lead, marker, spaces, rest = line:match("^( ? ? ?)([%-+*])( *)(.*)$")
+    local ordered = false
+    if marker == nil then
+        lead, marker, spaces, rest = line:match("^( ? ? ?)(%d%d?%d?%d?%d?%d?%d?%d?%d?[.)])( *)(.*)$")
+        ordered = marker ~= nil
+    end
+    if marker == nil then return nil end
+    if spaces == "" and rest ~= "" then return nil end
+    local width = #lead + #marker
+    local content
+    if rest == "" then
+        content = width + 1
+    elseif #spaces > 4 then
+        content = width + 1
+        rest = string.rep(" ", #spaces - 1) .. rest
+    else
+        content = width + #spaces
+    end
+    return {
+        ordered = ordered,
+        char = ordered and marker:sub(-1) or marker,
+        start = ordered and math.tointeger(tonumber(marker:sub(1, -2))) or nil,
+        content = content,
+        rest = rest,
+        empty = rest == "",
+    }
+end
+
+local HTML_BLOCK_TAGS = {}
+for tag in ([[address article aside base basefont blockquote body caption center col colgroup dd details dialog dir div dl dt
+fieldset figcaption figure footer form frame frameset h1 h2 h3 h4 h5 h6 head header hr html iframe legend li link main menu
+menuitem nav noframes ol optgroup option p param search section summary table tbody td tfoot th thead title tr track ul]]):gmatch("%S+") do
+    HTML_BLOCK_TAGS[tag] = true
+end
+
+local function tag_is_script(lower)
+    return lower:match("^</?script") or lower:match("^</?style") or lower:match("^</?pre") or lower:match("^</?textarea")
+end
+
+-- Returns the kind of HTML block that `line` starts, or nil. Kinds 1 to 5
+-- end with a marker. Kinds 6 and 7 end at a blank line.
+local function html_block_start(line, in_paragraph)
+    if indent_of(line) > 3 then return nil end
+    local s = line:match("^ *(.*)$")
+    local lower = s:lower()
+    if lower:match("^<script[%s>]") or lower:match("^<script$") or lower:match("^<pre[%s>]") or lower:match("^<pre$")
+        or lower:match("^<style[%s>]") or lower:match("^<style$") or lower:match("^<textarea[%s>]") or lower:match("^<textarea$") then
+        return 1
+    end
+    if s:match("^<!%-%-") then return 2 end
+    if s:match("^<%?") then return 3 end
+    if s:match("^<![%a]") then return 4 end
+    if s:match("^<!%[CDATA%[") then return 5 end
+    local tag = lower:match("^</?([%a][%w%-]*)")
+    if tag and HTML_BLOCK_TAGS[tag] then
+        local after = lower:match("^</?[%a][%w%-]*(.?)")
+        if after == "" or after:match("[%s>]") or lower:match("^</?[%a][%w%-]*/>") then
+            return 6
+        end
+    end
+    if not in_paragraph and not tag_is_script(lower) then
+        local attrs = s:match("^<[%a][%w%-]*(.-)/?>%s*$")
+        if (attrs and (attrs == "" or attrs:match("^%s")) and not attrs:find("[<>]")) or s:match("^</[%a][%w%-]*%s*>%s*$") then
+            return 7
+        end
+    end
+    return nil
+end
+
+local HTML_END = {
+    [1] = function(l) local x = l:lower() return x:find("</script>", 1, true) or x:find("</pre>", 1, true) or x:find("</style>", 1, true) or x:find("</textarea>", 1, true) end,
+    [2] = function(l) return l:find("-->", 1, true) end,
+    [3] = function(l) return l:find("?>", 1, true) end,
+    [4] = function(l) return l:find(">", 1, true) end,
+    [5] = function(l) return l:find("]]>", 1, true) end,
+}
+
+local function table_delimiter(line)
+    local s = line:match("^%s*(.-)%s*$")
+    if not s:find("-", 1, true) then return nil end
+    if s:sub(1, 1) == "|" then s = s:sub(2) end
+    if s:sub(-1) == "|" then s = s:sub(1, -2) end
+    local aligns = {}
+    for raw in (s .. "|"):gmatch("([^|]*)|") do
+        local cell = raw:match("^%s*(.-)%s*$")
+        if not cell:match("^:?%-+:?$") then return nil end
+        local left, right = cell:sub(1, 1) == ":", cell:sub(-1) == ":"
+        aligns[#aligns + 1] = (left and right) and "center" or right and "right" or left and "left" or false
+    end
+    return aligns
+end
+
+local function split_row(line)
+    local s = line:match("^%s*(.-)%s*$")
+    if s:sub(1, 1) == "|" then s = s:sub(2) end
+    if s:sub(-1) == "|" and s:sub(-2, -2) ~= "\\" then s = s:sub(1, -2) end
+    local cells, buf = {}, {}
+    local i = 1
+    while i <= #s do
+        local c = s:sub(i, i)
+        if c == "\\" and s:sub(i + 1, i + 1) == "|" then
+            buf[#buf + 1] = "|"
+            i = i + 2
+        elseif c == "|" then
+            cells[#cells + 1] = table.concat(buf):match("^%s*(.-)%s*$")
+            buf = {}
+            i = i + 1
+        else
+            buf[#buf + 1] = c
+            i = i + 1
+        end
+    end
+    cells[#cells + 1] = table.concat(buf):match("^%s*(.-)%s*$")
+    return cells
+end
+
+local parse_blocks
+
+-- Whether `line` starts a block that interrupts a paragraph.
+local function interrupts(line)
+    if is_blank(line) or thematic_break(line) or atx_heading(line) or fence_open(line) then
+        return true
+    end
+    if line:match("^ ? ? ?>") then
+        return true
+    end
+    local item = list_marker(line)
+    if item and not item.empty and (not item.ordered or item.start == 1) then
+        return true
+    end
+    local kind = html_block_start(line, true)
+    if kind and kind <= 6 then
+        return true
+    end
+    return false
+end
+
+-- Takes link reference definitions off the front of a paragraph's text.
+local function take_definitions(text, refs)
+    while true do
+        local label, after = link_label(text, (text:match("^ ? ? ?()")))
+        if label == nil or text:sub(after, after) ~= ":" then
+            return text
+        end
+        local i = after + 1
+        i = i + #text:match("^[ \t]*\n?[ \t]*", i)
+        local dest
+        if text:sub(i, i) == "<" then
+            local close = text:find(">", i, true)
+            if close == nil or text:sub(i, close):find("\n", 1, true) then return text end
+            dest = text:sub(i + 1, close - 1)
+            i = close + 1
+        else
+            dest = text:match("^[^%s%c]+", i)
+            if dest == nil then return text end
+            i = i + #dest
+        end
+        local before_title = i
+        local ws = text:match("^[ \t]*\n?[ \t]*", i)
+        local title
+        local q = text:sub(i + #ws, i + #ws)
+        local rest_after
+        if #ws > 0 and (q == '"' or q == "'" or q == "(") then
+            local close_char = q == "(" and ")" or q
+            local j = i + #ws + 1
+            while j <= #text and text:sub(j, j) ~= close_char do
+                if text:sub(j, j) == "\\" then j = j + 1 end
+                j = j + 1
+            end
+            if j <= #text then
+                local tail = text:match("^[ \t]*\n", j + 1) or text:match("^[ \t]*$", j + 1)
+                if tail then
+                    title = text:sub(i + #ws + 1, j - 1)
+                    rest_after = j + 1 + #tail
+                end
+            end
+        end
+        if rest_after == nil then
+            local tail = text:match("^[ \t]*\n", before_title) or text:match("^[ \t]*$", before_title)
+            if tail == nil then return text end
+            rest_after = before_title + #tail
+        end
+        local key = normalize_label(label)
+        if refs[key] == nil then
+            refs[key] = {
+                dest = unescape_backslash(decode_entities(dest)),
+                title = title and unescape_backslash(decode_entities(title)),
+            }
+        end
+        text = text:sub(rest_after)
+        if text == "" then
+            return text
+        end
+    end
+end
+
+-- Parses lines into a list of blocks. Returns the blocks and whether blank
+-- lines separated two of them, which makes a list loose.
+parse_blocks = function(lines, refs, opts)
+    local blocks = {}
+    local i, n = 1, #lines
+    local saw_blank_between = false
+    local pending_blank = false
+    local function add(block)
+        if pending_blank and #blocks > 0 then
+            saw_blank_between = true
+        end
+        pending_blank = false
+        blocks[#blocks + 1] = block
+    end
+    while i <= n do
+        local line = lines[i]
+        local ind = indent_of(line)
+        if is_blank(line) then
+            pending_blank = true
+            i = i + 1
+        elseif ind >= 4 then
+            local code = {}
+            while i <= n and (indent_of(lines[i]) >= 4 or is_blank(lines[i])) do
+                code[#code + 1] = lines[i]:sub(5)
+                i = i + 1
+            end
+            while #code > 0 and is_blank(code[#code]) do
+                code[#code] = nil
+                i = i - 1
+            end
+            add({ type = "code_block", text = table.concat(code, "\n") .. "\n" })
+        elseif fence_open(line) then
+            local fence_ind, fence, info = fence_open(line)
+            local char = fence:sub(1, 1)
+            local code = {}
+            i = i + 1
+            while i <= n do
+                local l = lines[i]
+                local close = l:match("^ ? ? ?(" .. (char == "`" and "`" or "~") .. "+)%s*$")
+                if close and #close >= #fence then
+                    i = i + 1
+                    break
+                end
+                -- The content loses up to the indentation of the fence.
+                local strip = math.min(indent_of(l), fence_ind)
+                code[#code + 1] = l:sub(strip + 1)
+                i = i + 1
+            end
+            add({ type = "code_block", info = unescape_backslash(decode_entities(info)), text = #code > 0 and table.concat(code, "\n") .. "\n" or "" })
+        elseif atx_heading(line) then
+            local level, text = atx_heading(line)
+            add({ type = "heading", level = level, raw = text })
+            i = i + 1
+        elseif thematic_break(line) then
+            add({ type = "thematic_break" })
+            i = i + 1
+        elseif line:match("^ ? ? ?>") then
+            local inner = {}
+            local last_text = false
+            while i <= n do
+                local l = lines[i]
+                local quoted = l:match("^ ? ? ?> ?(.*)$")
+                if quoted then
+                    inner[#inner + 1] = quoted
+                    last_text = not is_blank(quoted) and not fence_open(quoted) and indent_of(quoted) < 4
+                    i = i + 1
+                elseif last_text and not is_blank(l) and not interrupts(l) then
+                    -- A lazy continuation line of a paragraph.
+                    inner[#inner + 1] = l
+                    i = i + 1
+                else
+                    break
+                end
+            end
+            add({ type = "blockquote", children = (parse_blocks(inner, refs, opts)) })
+        elseif list_marker(line) and not (thematic_break(line)) then
+            local first = list_marker(line)
+            local list = { type = "list", ordered = first.ordered, start = first.start, char = first.char, children = {}, tight = true }
+            local blank_between_items = false
+            while i <= n do
+                local item = list_marker(lines[i])
+                if item == nil or item.ordered ~= first.ordered or item.char ~= first.char or thematic_break(lines[i]) then
+                    break
+                end
+                local content = { item.rest }
+                local width = item.content
+                i = i + 1
+                local last_text = not item.empty
+                local trailing_blanks = 0
+                if item.empty and i <= n and is_blank(lines[i]) then
+                    -- An item may start with at most one blank line.
+                    trailing_blanks = 0
+                else
+                    while i <= n do
+                        local l = lines[i]
+                        if is_blank(l) then
+                            content[#content + 1] = ""
+                            trailing_blanks = trailing_blanks + 1
+                            last_text = false
+                            i = i + 1
+                        elseif indent_of(l) >= width then
+                            content[#content + 1] = l:sub(width + 1)
+                            trailing_blanks = 0
+                            last_text = true
+                            i = i + 1
+                        elseif last_text and not interrupts(l) and not list_marker(l) then
+                            content[#content + 1] = l
+                            i = i + 1
+                        else
+                            break
+                        end
+                    end
+                end
+                -- Blank lines at the end of an item belong between items.
+                while #content > 1 and content[#content] == "" do
+                    content[#content] = nil
+                end
+                if trailing_blanks > 0 and i <= n then
+                    local nxt = list_marker(lines[i])
+                    if nxt and nxt.ordered == first.ordered and nxt.char == first.char then
+                        blank_between_items = true
+                    end
+                end
+                local checked
+                if opts.tasks then
+                    local box, rest = content[1]:match("^%[([ xX])%] (.*)$")
+                    if box then
+                        checked = box ~= " "
+                        content[1] = rest
+                    end
+                end
+                local children, loose = parse_blocks(content, refs, opts)
+                if loose then
+                    list.tight = false
+                end
+                list.children[#list.children + 1] = { type = "item", children = children, checked = checked }
+                if trailing_blanks > 0 and (i > n or not list_marker(lines[i])) then
+                    pending_blank = true
+                    break
+                end
+            end
+            if blank_between_items then
+                list.tight = false
+            end
+            add(list)
+        elseif html_block_start(line, false) then
+            local kind = html_block_start(line, false)
+            local html = {}
+            if kind <= 5 then
+                while i <= n do
+                    html[#html + 1] = lines[i]
+                    local done = HTML_END[kind](lines[i])
+                    i = i + 1
+                    if done then break end
+                end
+            else
+                while i <= n and not is_blank(lines[i]) do
+                    html[#html + 1] = lines[i]
+                    i = i + 1
+                end
+            end
+            add({ type = "html_block", text = table.concat(html, "\n") .. "\n" })
+        elseif opts.tables and line:find("|", 1, true) and i < n and table_delimiter(lines[i + 1])
+            and #split_row(line) == #table_delimiter(lines[i + 1]) then
+            local aligns = table_delimiter(lines[i + 1])
+            local head = split_row(line)
+            local rows = {}
+            i = i + 2
+            while i <= n and not is_blank(lines[i]) and not interrupts(lines[i]) do
+                local cells = split_row(lines[i])
+                local row = {}
+                for c = 1, #aligns do
+                    row[c] = cells[c] or ""
+                end
+                rows[#rows + 1] = row
+                i = i + 1
+            end
+            add({ type = "table", aligns = aligns, head = head, rows = rows })
+        else
+            local para = { line:match("^ *(.-)$") }
+            i = i + 1
+            local setext
+            while i <= n do
+                local l = lines[i]
+                if l:match("^ ? ? ?=+%s*$") then
+                    setext = 1
+                    i = i + 1
+                    break
+                elseif l:match("^ ? ? ?%-+%s*$") then
+                    setext = 2
+                    i = i + 1
+                    break
+                end
+                if is_blank(l) or (interrupts(l) and indent_of(l) < 4) then
+                    break
+                end
+                para[#para + 1] = l:match("^ *(.-)$")
+                i = i + 1
+            end
+            local text = table.concat(para, "\n")
+            text = take_definitions(text, refs)
+            if text:match("^%s*$") then
+                if setext then
+                    -- An underline after only definitions is a paragraph of its own.
+                    add({ type = "paragraph", raw = lines[i - 1]:match("^ *(.-)%s*$") })
+                end
+            elseif setext then
+                add({ type = "heading", level = setext, raw = text:match("^(.-)%s*$") })
+            else
+                add({ type = "paragraph", raw = text })
+            end
+        end
+    end
+    return blocks, saw_blank_between
+end
+
+-- Resolves the inline content of every block once all reference
+-- definitions are known.
+local function resolve_inlines(blocks, refs, opts)
+    for _, b in ipairs(blocks) do
+        if b.raw then
+            b.children = parse_inlines(b.raw, refs, opts)
+            b.raw = nil
+        elseif b.type == "table" then
+            local head = {}
+            for c, cell in ipairs(b.head) do
+                head[c] = parse_inlines(cell, refs, opts)
+            end
+            b.head = head
+            for r, row in ipairs(b.rows) do
+                local cells = {}
+                for c, cell in ipairs(row) do
+                    cells[c] = parse_inlines(cell, refs, opts)
+                end
+                b.rows[r] = cells
+            end
+        elseif b.children then
+            resolve_inlines(b.children, refs, opts)
+        end
+    end
+end
+
+local DEFAULTS = { html = false, tables = true, strikethrough = true, tasks = true, autolinks = true, unsafe_links = false }
+
+local function options_of(options)
+    local opts = {}
+    for k, v in pairs(DEFAULTS) do
+        opts[k] = v
+    end
+    for k, v in pairs(options or {}) do
+        opts[k] = v
+    end
+    return opts
+end
+
+--- Parses Markdown and returns its syntax tree.
+---
+--- The root is `{ type = "document", children = BLOCKS }`. Block nodes have
+--- the types `paragraph`, `heading` (with `level`), `thematic_break`,
+--- `code_block` (with `info` and `text`), `blockquote`, `list` (with
+--- `ordered`, `start`, and `tight`), `item` (with `checked` for a task),
+--- `html_block` (with `text`), and `table` (with `aligns`, `head`, and
+--- `rows` of inline lists). Inline nodes have the types `text`, `softbreak`,
+--- `linebreak`, `code`, `emph`, `strong`, `strikethrough`, `link` and
+--- `image` (with `dest` and `title`), `html_inline`, and `entity`. Nodes that
+--- contain others have `children`. `options` is the table that `render`
+--- takes. Every input parses, so `parse` raises no error for any string.
+--- @param text string The Markdown text.
+--- @param options table? The options.
+--- @return table
+function M.parse(text, options)
+    local opts = options_of(options)
+    text = text:gsub("\r\n?", "\n"):gsub("%z", "\u{FFFD}")
+    local lines = {}
+    for line in (text:sub(-1) == "\n" and text or text .. "\n"):gmatch("(.-)\n") do
+        lines[#lines + 1] = expand_tabs(line)
+    end
+    local refs = {}
+    local blocks = parse_blocks(lines, refs, opts)
+    resolve_inlines(blocks, refs, opts)
+    return { type = "document", children = blocks, refs = refs }
+end
+
+-- Rendering ---------------------------------------------------------------------------
+
+local render_inlines
+
+local function plain_text(nodes, out)
+    for _, node in ipairs(nodes) do
+        if node.type == "text" or node.type == "code" then
+            out[#out + 1] = escape_html(node.text)
+        elseif node.type == "entity" then
+            out[#out + 1] = node.text
+        elseif node.type == "softbreak" or node.type == "linebreak" then
+            out[#out + 1] = "\n"
+        elseif node.children then
+            plain_text(node.children, out)
+        end
+    end
+end
+
+render_inlines = function(nodes, opts, out)
+    for _, node in ipairs(nodes) do
+        local t = node.type
+        if t == "text" then
+            out[#out + 1] = escape_html(node.text)
+        elseif t == "entity" then
+            out[#out + 1] = node.text
+        elseif t == "softbreak" then
+            out[#out + 1] = "\n"
+        elseif t == "linebreak" then
+            out[#out + 1] = "<br />\n"
+        elseif t == "code" then
+            out[#out + 1] = "<code>" .. escape_html(node.text) .. "</code>"
+        elseif t == "emph" or t == "strong" or t == "strikethrough" then
+            local tag = t == "emph" and "em" or t == "strong" and "strong" or "del"
+            if t == "strikethrough" and not opts.strikethrough then
+                out[#out + 1] = "~~"
+                render_inlines(node.children, opts, out)
+                out[#out + 1] = "~~"
+            else
+                out[#out + 1] = "<" .. tag .. ">"
+                render_inlines(node.children, opts, out)
+                out[#out + 1] = "</" .. tag .. ">"
+            end
+        elseif t == "link" then
+            local dest = opts.unsafe_links and node.dest or safe_dest(node.dest, false)
+            out[#out + 1] = '<a href="' .. encode_url(dest) .. '"'
+            if node.title then
+                out[#out + 1] = ' title="' .. escape_html(node.title) .. '"'
+            end
+            out[#out + 1] = ">"
+            render_inlines(node.children, opts, out)
+            out[#out + 1] = "</a>"
+        elseif t == "image" then
+            local dest = opts.unsafe_links and node.dest or safe_dest(node.dest, true)
+            local alt = {}
+            plain_text(node.children, alt)
+            out[#out + 1] = '<img src="' .. encode_url(dest) .. '" alt="' .. table.concat(alt) .. '"'
+            if node.title then
+                out[#out + 1] = ' title="' .. escape_html(node.title) .. '"'
+            end
+            out[#out + 1] = " />"
+        elseif t == "html_inline" then
+            out[#out + 1] = opts.html and node.text or escape_html(node.text)
+        end
+    end
+end
+
+local render_blocks
+
+render_blocks = function(blocks, opts, out, tight)
+    for _, b in ipairs(blocks) do
+        local t = b.type
+        if t == "paragraph" then
+            if tight then
+                render_inlines(b.children, opts, out)
+                out[#out + 1] = "\n"
+            else
+                out[#out + 1] = "<p>"
+                render_inlines(b.children, opts, out)
+                out[#out + 1] = "</p>\n"
+            end
+        elseif t == "heading" then
+            out[#out + 1] = "<h" .. b.level .. ">"
+            render_inlines(b.children, opts, out)
+            out[#out + 1] = "</h" .. b.level .. ">\n"
+        elseif t == "thematic_break" then
+            out[#out + 1] = "<hr />\n"
+        elseif t == "code_block" then
+            local lang = b.info and b.info:match("^(%S+)")
+            if lang then
+                out[#out + 1] = '<pre><code class="language-' .. escape_html(lang) .. '">'
+            else
+                out[#out + 1] = "<pre><code>"
+            end
+            out[#out + 1] = escape_html(b.text) .. "</code></pre>\n"
+        elseif t == "blockquote" then
+            out[#out + 1] = "<blockquote>\n"
+            render_blocks(b.children, opts, out, false)
+            out[#out + 1] = "</blockquote>\n"
+        elseif t == "list" then
+            local tag = b.ordered and "ol" or "ul"
+            if b.ordered and b.start ~= 1 then
+                out[#out + 1] = '<ol start="' .. b.start .. '">\n'
+            else
+                out[#out + 1] = "<" .. tag .. ">\n"
+            end
+            for _, item in ipairs(b.children) do
+                out[#out + 1] = "<li>"
+                if item.checked ~= nil then
+                    out[#out + 1] = item.checked and '<input checked="" disabled="" type="checkbox" /> ' or '<input disabled="" type="checkbox" /> '
+                end
+                local children = item.children
+                if #children > 0 and not (b.tight and children[1].type == "paragraph") then
+                    out[#out + 1] = "\n"
+                end
+                render_blocks(children, opts, out, b.tight)
+                -- A tight item ends without the line break of its last paragraph.
+                if b.tight and #children > 0 and children[#children].type == "paragraph" and out[#out] == "\n" then
+                    out[#out] = nil
+                end
+                out[#out + 1] = "</li>\n"
+            end
+            out[#out + 1] = "</" .. tag .. ">\n"
+        elseif t == "html_block" then
+            out[#out + 1] = opts.html and b.text or "<p>" .. escape_html(b.text:gsub("\n$", "")) .. "</p>\n"
+        elseif t == "table" then
+            out[#out + 1] = "<table>\n<thead>\n<tr>\n"
+            for c, cell in ipairs(b.head) do
+                local align = b.aligns[c]
+                out[#out + 1] = align and ('<th align="' .. align .. '">') or "<th>"
+                render_inlines(cell, opts, out)
+                out[#out + 1] = "</th>\n"
+            end
+            out[#out + 1] = "</tr>\n</thead>\n"
+            if #b.rows > 0 then
+                out[#out + 1] = "<tbody>\n"
+                for _, row in ipairs(b.rows) do
+                    out[#out + 1] = "<tr>\n"
+                    for c, cell in ipairs(row) do
+                        local align = b.aligns[c]
+                        out[#out + 1] = align and ('<td align="' .. align .. '">') or "<td>"
+                        render_inlines(cell, opts, out)
+                        out[#out + 1] = "</td>\n"
+                    end
+                    out[#out + 1] = "</tr>\n"
+                end
+                out[#out + 1] = "</tbody>\n"
+            end
+            out[#out + 1] = "</table>\n"
+        end
+    end
+end
+
+--- Renders a syntax tree from `markdown.parse` to HTML.
+--- @param tree table The tree.
+--- @param options table? The options of `render`.
+--- @return string
+function M.html(tree, options)
+    local out = {}
+    render_blocks(tree.children, options_of(options), out, false)
+    return table.concat(out)
+end
+
+--- Renders Markdown to HTML and returns it.
+---
+--- The options are the following, each with its default.
+---
+--- - `html = false`: raw HTML blocks and inline HTML are escaped. With
+---   `true` they pass through unchanged, which is safe only for trusted
+---   input.
+--- - `unsafe_links = false`: link destinations with the schemes
+---   `javascript`, `vbscript`, `file`, and `data` become empty, except
+---   images of `data:image` types other than SVG. With `true` every
+---   destination is kept.
+--- - `tables = true`, `strikethrough = true`, `tasks = true`, and
+---   `autolinks = true` turn the GitHub extensions on.
+---
+--- Every input renders, so `render` raises no error for any string.
+--- @param text string The Markdown text.
+--- @param options table? The options.
+--- @return string
+function M.render(text, options)
+    return M.html(M.parse(text, options), options)
+end
+
+return M
