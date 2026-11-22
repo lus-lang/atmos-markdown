@@ -79,10 +79,8 @@ local ENTITIES = { amp = "&", lt = "<", gt = ">", quot = '"', apos = "'", nbsp =
 
 local function decode_entities(s)
     return (s:gsub("&(#?[%w]+);", function(name)
-        local hex = name:match("^#[xX](%x+)$")
-        if hex then return utf8.char(math.min(tonumber(hex, 16), 0x10FFFF)) end
-        local dec = name:match("^#(%d+)$")
-        if dec then
+        if hex = name:match("^#[xX](%x+)$") then return utf8.char(math.min(tonumber(hex, 16), 0x10FFFF)) end
+        if dec = name:match("^#(%d+)$") then
             local n = tonumber(dec)
             if n == 0 or n > 0x10FFFF then n = 0xFFFD end
             return utf8.char(n)
@@ -457,8 +455,7 @@ parse_inlines = function(s, refs, opts)
                         key = normalize_label(s:sub(opener.pos, i - 1))
                         after = i + 1
                     end
-                    local ref = refs[key]
-                    if ref then
+                    if ref = refs[key] then
                         dest, title = ref.dest, ref.title
                     else
                         after = nil
@@ -508,8 +505,7 @@ parse_inlines = function(s, refs, opts)
                 push({ type = "link", dest = "mailto:" .. email, children = { text_node(email) }, autolink = true })
                 i = i + #email + 2
             else
-                local stop = html_inline_at(s, i)
-                if stop then
+                if stop = html_inline_at(s, i) then
                     push({ type = "html_inline", text = s:sub(i, stop) })
                     i = stop + 1
                 else
@@ -535,9 +531,8 @@ parse_inlines = function(s, refs, opts)
             i = i + 1
             i = i + #s:match("^ *", i)
         elseif c == "&" then
-            local ent = s:match("^&#[xX]%x%x?%x?%x?%x?%x?;", i) or s:match("^&#%d%d?%d?%d?%d?%d?%d?;", i)
-                or s:match("^&[%a][%w]+;", i)
-            if ent then
+            if ent = s:match("^&#[xX]%x%x?%x?%x?%x?%x?;", i) or s:match("^&#%d%d?%d?%d?%d?%d?%d?;", i)
+                or s:match("^&[%a][%w]+;", i) then
                 local decoded = decode_entities(ent)
                 if decoded ~= ent then
                     buf[#buf + 1] = decoded
@@ -550,8 +545,7 @@ parse_inlines = function(s, refs, opts)
                 i = i + 1
             end
         elseif opts.autolinks and (c == "h" or c == "w") and (i == 1 or s:sub(i - 1, i - 1):match("[%s%*_~%(]")) then
-            local url = s:match("^https?://[%w%-]+[%.%w%-]*[^%s<]*", i) or s:match("^www%.[%w%-]+[%.%w%-]*[^%s<]*", i)
-            if url then
+            if url = s:match("^https?://[%w%-]+[%.%w%-]*[^%s<]*", i) or s:match("^www%.[%w%-]+[%.%w%-]*[^%s<]*", i) then
                 -- Trailing punctuation is not part of the link.
                 url = url:gsub("[%?!%.,:%*_~]+$", "")
                 local opens = select(2, url:gsub("%(", ""))
@@ -560,8 +554,7 @@ parse_inlines = function(s, refs, opts)
                     url = url:sub(1, -2)
                     closes = closes - 1
                 end
-                local entity = url:match("&%w+;$")
-                if entity then url = url:sub(1, #url - #entity) end
+                if entity = url:match("&%w+;$") then url = url:sub(1, #url - #entity) end
                 local dest = url:sub(1, 4) == "www." and "http://" .. url or url
                 push({ type = "link", dest = dest, children = { text_node(url) }, autolink = true })
                 i = i + #url
@@ -570,8 +563,7 @@ parse_inlines = function(s, refs, opts)
                 i = i + 1
             end
         else
-            local plain = s:match("^[^\\`%*_~!%[%]<\n&hw]+", i)
-            if plain then
+            if plain = s:match("^[^\\`%*_~!%[%]<\n&hw]+", i) then
                 buf[#buf + 1] = plain
                 i = i + #plain
             else
@@ -832,8 +824,7 @@ local function take_definitions(text, refs)
                 j = j + 1
             end
             if j <= #text then
-                local tail = text:match("^[ \t]*\n", j + 1) or text:match("^[ \t]*$", j + 1)
-                if tail then
+                if tail = text:match("^[ \t]*\n", j + 1) or text:match("^[ \t]*$", j + 1) then
                     title = text:sub(i + #ws + 1, j - 1)
                     rest_after = j + 1 + #tail
                 end
@@ -919,8 +910,7 @@ parse_blocks = function(lines, refs, opts)
             local last_text = false
             while i <= n do
                 local l = lines[i]
-                local quoted = l:match("^ ? ? ?> ?(.*)$")
-                if quoted then
+                if quoted = l:match("^ ? ? ?> ?(.*)$") then
                     inner[#inner + 1] = quoted
                     last_text = not is_blank(quoted) and not fence_open(quoted) and indent_of(quoted) < 4
                     i = i + 1
@@ -1228,8 +1218,7 @@ render_blocks = function(blocks, opts, out, tight)
         elseif t == "thematic_break" then
             out[#out + 1] = "<hr />\n"
         elseif t == "code_block" then
-            local lang = b.info and b.info:match("^(%S+)")
-            if lang then
+            if lang = b.info and b.info:match("^(%S+)") then
                 out[#out + 1] = '<pre><code class="language-' .. escape_html(lang) .. '">'
             else
                 out[#out + 1] = "<pre><code>"
