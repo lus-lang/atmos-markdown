@@ -1,13 +1,14 @@
 --- Renders CommonMark to HTML, with the GitHub extensions for tables,
 --- strikethrough, task lists, and autolinks.
 ---
---- `markdown.render` returns the HTML of a text. `markdown.parse` returns its
---- syntax tree as nested tables, and `markdown.html` renders a tree, so a
---- program can change the tree in between. Raw HTML in the input is escaped
---- unless the `html` option is true.
+--- `markdown.render` returns the HTML of a text. A program that changes the
+--- document before rendering it calls `markdown.parse`, which returns the
+--- syntax tree as nested tables, edits the tree, then renders it with
+--- `markdown.html`. Raw HTML in the input is escaped unless the `html` option
+--- is true.
 ---
 --- @package markdown
---- @version 0.1.0
+--- @version 1.0.0
 --- @lus 2.0
 --- @license 0BSD
 --- @repository https://github.com/lus-lang/atmos-markdown
@@ -23,7 +24,7 @@ local function is_space(c)
 end
 
 local function is_punct(c)
-    return c ~= "" and c:match("^" .. PUNCT .. "$") ~= nil
+    return c ~= "" and c:match(`^$PUNCT\$`) ~= nil
 end
 
 local function escape_html(s)
@@ -36,7 +37,7 @@ local function encode_url(url)
     local out = {}
     for _, code in utf8.codes(url, true) do
         local c = utf8.char(code)
-        if code < 128 and c:match("^" .. SAFE_URL .. "$") then
+        if code < 128 and c:match(`^$SAFE_URL\$`) then
             out[#out + 1] = c
         else
             local bytes = vector.fromstring(c)
@@ -90,7 +91,7 @@ local function decode_entities(s)
 end
 
 local function unescape_backslash(s)
-    return (s:gsub("\\(" .. PUNCT .. ")", "%1"))
+    return (s:gsub(`\\($PUNCT)`, "%1"))
 end
 
 local function normalize_label(s)
@@ -397,7 +398,7 @@ parse_inlines = function(s, refs, opts)
                 i = i + #run
             end
         elseif c == "*" or c == "_" or c == "~" then
-            local run = s:match("^%" .. c .. "+", i)
+            local run = s:match(`^%$c+`, i)
             local prev, nxt = char_before(s, i), char_after(s, i + #run - 1)
             local left, right = flanking(prev, nxt)
             local can_open, can_close
@@ -887,7 +888,8 @@ parse_blocks = function(lines, refs, opts)
             i = i + 1
             while i <= n do
                 local l = lines[i]
-                local close = l:match("^ ? ? ?(" .. (char == "`" and "`" or "~") .. "+)%s*$")
+                local mark = char == "`" and "`" or "~"
+                local close = l:match(`^ ? ? ?($mark+)%s*\$`)
                 if close and #close >= #fence then
                     i = i + 1
                     break
@@ -1161,7 +1163,7 @@ render_inlines = function(nodes, opts, out)
         elseif t == "linebreak" then
             out[#out + 1] = "<br />\n"
         elseif t == "code" then
-            out[#out + 1] = "<code>" .. escape_html(node.text) .. "</code>"
+            out[#out + 1] = `<code>$(escape_html(node.text))</code>`
         elseif t == "emph" or t == "strong" or t == "strikethrough" then
             local tag = t == "emph" and "em" or t == "strong" and "strong" or "del"
             if t == "strikethrough" and not opts.strikethrough then
@@ -1169,15 +1171,15 @@ render_inlines = function(nodes, opts, out)
                 render_inlines(node.children, opts, out)
                 out[#out + 1] = "~~"
             else
-                out[#out + 1] = "<" .. tag .. ">"
+                out[#out + 1] = `<$tag>`
                 render_inlines(node.children, opts, out)
-                out[#out + 1] = "</" .. tag .. ">"
+                out[#out + 1] = `</$tag>`
             end
         elseif t == "link" then
             local dest = opts.unsafe_links and node.dest or safe_dest(node.dest, false)
-            out[#out + 1] = '<a href="' .. encode_url(dest) .. '"'
+            out[#out + 1] = `<a href="$(encode_url(dest))"`
             if node.title then
-                out[#out + 1] = ' title="' .. escape_html(node.title) .. '"'
+                out[#out + 1] = ` title="$(escape_html(node.title))"`
             end
             out[#out + 1] = ">"
             render_inlines(node.children, opts, out)
@@ -1186,9 +1188,9 @@ render_inlines = function(nodes, opts, out)
             local dest = opts.unsafe_links and node.dest or safe_dest(node.dest, true)
             local alt = {}
             plain_text(node.children, alt)
-            out[#out + 1] = '<img src="' .. encode_url(dest) .. '" alt="' .. table.concat(alt) .. '"'
+            out[#out + 1] = `<img src="$(encode_url(dest))" alt="$(table.concat(alt))"`
             if node.title then
-                out[#out + 1] = ' title="' .. escape_html(node.title) .. '"'
+                out[#out + 1] = ` title="$(escape_html(node.title))"`
             end
             out[#out + 1] = " />"
         elseif t == "html_inline" then
@@ -1212,14 +1214,14 @@ render_blocks = function(blocks, opts, out, tight)
                 out[#out + 1] = "</p>\n"
             end
         elseif t == "heading" then
-            out[#out + 1] = "<h" .. b.level .. ">"
+            out[#out + 1] = `<h$(b.level)>`
             render_inlines(b.children, opts, out)
-            out[#out + 1] = "</h" .. b.level .. ">\n"
+            out[#out + 1] = `</h$(b.level)>\n`
         elseif t == "thematic_break" then
             out[#out + 1] = "<hr />\n"
         elseif t == "code_block" then
             if lang = b.info and b.info:match("^(%S+)") then
-                out[#out + 1] = '<pre><code class="language-' .. escape_html(lang) .. '">'
+                out[#out + 1] = `<pre><code class="language-$(escape_html(lang))">`
             else
                 out[#out + 1] = "<pre><code>"
             end
@@ -1231,9 +1233,9 @@ render_blocks = function(blocks, opts, out, tight)
         elseif t == "list" then
             local tag = b.ordered and "ol" or "ul"
             if b.ordered and b.start ~= 1 then
-                out[#out + 1] = '<ol start="' .. b.start .. '">\n'
+                out[#out + 1] = `<ol start="$(b.start)">\n`
             else
-                out[#out + 1] = "<" .. tag .. ">\n"
+                out[#out + 1] = `<$tag>\n`
             end
             for _, item in ipairs(b.children) do
                 out[#out + 1] = "<li>"
@@ -1251,14 +1253,14 @@ render_blocks = function(blocks, opts, out, tight)
                 end
                 out[#out + 1] = "</li>\n"
             end
-            out[#out + 1] = "</" .. tag .. ">\n"
+            out[#out + 1] = `</$tag>\n`
         elseif t == "html_block" then
-            out[#out + 1] = opts.html and b.text or "<p>" .. escape_html(b.text:gsub("\n$", "")) .. "</p>\n"
+            out[#out + 1] = opts.html and b.text or `<p>$(escape_html(b.text:gsub("\n$", "")))</p>\n`
         elseif t == "table" then
             out[#out + 1] = "<table>\n<thead>\n<tr>\n"
             for c, cell in ipairs(b.head) do
                 local align = b.aligns[c]
-                out[#out + 1] = align and ('<th align="' .. align .. '">') or "<th>"
+                out[#out + 1] = align and (`<th align="$align">`) or "<th>"
                 render_inlines(cell, opts, out)
                 out[#out + 1] = "</th>\n"
             end
@@ -1269,7 +1271,7 @@ render_blocks = function(blocks, opts, out, tight)
                     out[#out + 1] = "<tr>\n"
                     for c, cell in ipairs(row) do
                         local align = b.aligns[c]
-                        out[#out + 1] = align and ('<td align="' .. align .. '">') or "<td>"
+                        out[#out + 1] = align and (`<td align="$align">`) or "<td>"
                         render_inlines(cell, opts, out)
                         out[#out + 1] = "</td>\n"
                     end
@@ -1297,12 +1299,12 @@ end
 --- The options are the following, each with its default.
 ---
 --- - `html = false`: raw HTML blocks and inline HTML are escaped. With
----   `true` they pass through unchanged, which is safe only for trusted
----   input.
+---   `true` they are copied to the output unchanged, which is safe only for
+---   trusted input.
 --- - `unsafe_links = false`: link destinations with the schemes
----   `javascript`, `vbscript`, `file`, and `data` become empty, except
----   images of `data:image` types other than SVG. With `true` every
----   destination is kept.
+---   `javascript`, `vbscript`, `file`, and `data` become empty. An image
+---   keeps a `data:image` destination of any type other than SVG. With
+---   `true` every destination is kept.
 --- - `tables = true`, `strikethrough = true`, `tasks = true`, and
 ---   `autolinks = true` turn the GitHub extensions on.
 ---
