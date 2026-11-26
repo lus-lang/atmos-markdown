@@ -7,12 +7,21 @@ local markdown = require("markdown")
 -- Each case is { markdown, expected html, name }.
 local function check(cases, options)
     local failures = {}
+
     for _, case in ipairs(cases) do
-        local got = markdown.render(case[1], options)
-        if got ~= case[2] then
-            failures[#failures + 1] = `$(case[3])\n  input:    $(tojson(case[1]))\n  expected: $(tojson(case[2]))\n  got:      $(tojson(got))`
+        local input, expected, name = table.unpack(case)
+        local got = markdown.render(input, options)
+
+        if got ~= expected then
+            failures[#failures + 1] = table.concat({
+                name,
+                `  input:    $(tojson(input))`,
+                `  expected: $(tojson(expected))`,
+                `  got:      $(tojson(got))`,
+            }, "\n")
         end
     end
+
     assert(#failures == 0, table.concat(failures, "\n"))
 end
 
@@ -24,7 +33,11 @@ local function headings_test()
         { "# foo ##\n", "<h1>foo</h1>\n", "closing sequence" },
         { "### foo ### b\n", "<h3>foo ### b</h3>\n", "not a closing sequence" },
         { "#\n", "<h1></h1>\n", "empty heading" },
-        { "Foo *bar*\n=========\n\nFoo *bar*\n---------\n", "<h1>Foo <em>bar</em></h1>\n<h2>Foo <em>bar</em></h2>\n", "setext" },
+        {
+            "Foo *bar*\n=========\n\nFoo *bar*\n---------\n",
+            "<h1>Foo <em>bar</em></h1>\n<h2>Foo <em>bar</em></h2>\n",
+            "setext",
+        },
         { "Foo\nbar\n===\n", "<h1>Foo\nbar</h1>\n", "multi-line setext" },
     })
 end
@@ -43,10 +56,22 @@ end
 
 local function code_test()
     check({
-        { "    a simple\n      indented code block\n", "<pre><code>a simple\n  indented code block\n</code></pre>\n", "indented" },
+        {
+            "    a simple\n      indented code block\n",
+            "<pre><code>a simple\n  indented code block\n</code></pre>\n",
+            "indented",
+        },
         { "```\n<\n >\n```\n", "<pre><code>&lt;\n &gt;\n</code></pre>\n", "fenced" },
-        { "~~~ruby startline=3\ndef foo(x)\nend\n~~~\n", "<pre><code class=\"language-ruby\">def foo(x)\nend\n</code></pre>\n", "info string" },
-        { "````\naaa\n```\n``````\n", "<pre><code>aaa\n```\n</code></pre>\n", "longer closing fence" },
+        {
+            "~~~ruby startline=3\ndef foo(x)\nend\n~~~\n",
+            "<pre><code class=\"language-ruby\">def foo(x)\nend\n</code></pre>\n",
+            "info string",
+        },
+        {
+            "````\naaa\n```\n``````\n",
+            "<pre><code>aaa\n```\n</code></pre>\n",
+            "longer closing fence",
+        },
         { "```\n", "<pre><code></code></pre>\n", "unclosed empty fence" },
         { " ```\n aaa\naaa\n```\n", "<pre><code>aaa\naaa\n</code></pre>\n", "indented fence" },
         { "`foo`\n", "<p><code>foo</code></p>\n", "code span" },
@@ -59,25 +84,69 @@ end
 
 local function blockquotes_test()
     check({
-        { "> # Foo\n> bar\n> baz\n", "<blockquote>\n<h1>Foo</h1>\n<p>bar\nbaz</p>\n</blockquote>\n", "basic" },
-        { "> bar\nbaz\n> foo\n", "<blockquote>\n<p>bar\nbaz\nfoo</p>\n</blockquote>\n", "lazy continuation" },
+        {
+            "> # Foo\n> bar\n> baz\n",
+            "<blockquote>\n<h1>Foo</h1>\n<p>bar\nbaz</p>\n</blockquote>\n",
+            "basic",
+        },
+        {
+            "> bar\nbaz\n> foo\n",
+            "<blockquote>\n<p>bar\nbaz\nfoo</p>\n</blockquote>\n",
+            "lazy continuation",
+        },
         { "> foo\n---\n", "<blockquote>\n<p>foo</p>\n</blockquote>\n<hr />\n", "break ends quote" },
         { ">\n", "<blockquote>\n</blockquote>\n", "empty" },
-        { "> > > foo\nbar\n", "<blockquote>\n<blockquote>\n<blockquote>\n<p>foo\nbar</p>\n</blockquote>\n</blockquote>\n</blockquote>\n", "nested lazy" },
+        {
+            "> > > foo\nbar\n",
+            "<blockquote>\n<blockquote>\n<blockquote>\n<p>foo\nbar</p>\n</blockquote>\n</blockquote>\n</blockquote>\n",
+            "nested lazy",
+        },
     })
 end
 
 local function lists_test()
     check({
-        { "- foo\n- bar\n+ baz\n", "<ul>\n<li>foo</li>\n<li>bar</li>\n</ul>\n<ul>\n<li>baz</li>\n</ul>\n", "bullet change starts a list" },
-        { "1. foo\n2. bar\n3) baz\n", "<ol>\n<li>foo</li>\n<li>bar</li>\n</ol>\n<ol start=\"3\">\n<li>baz</li>\n</ol>\n", "ordered" },
-        { "- foo\n\n- bar\n", "<ul>\n<li>\n<p>foo</p>\n</li>\n<li>\n<p>bar</p>\n</li>\n</ul>\n", "loose" },
-        { "- a\n  - b\n    - c\n", "<ul>\n<li>a\n<ul>\n<li>b\n<ul>\n<li>c</li>\n</ul>\n</li>\n</ul>\n</li>\n</ul>\n", "nested" },
-        { "1. a\n\n   b\n", "<ol>\n<li>\n<p>a</p>\n<p>b</p>\n</li>\n</ol>\n", "two paragraphs in an item" },
-        { "- foo\n  ```\n  bar\n  ```\n", "<ul>\n<li>foo\n<pre><code>bar\n</code></pre>\n</li>\n</ul>\n", "code in a tight item" },
-        { "The number of windows in my house is\n14.  The number of doors is 6.\n", "<p>The number of windows in my house is\n14.  The number of doors is 6.</p>\n", "ordered list must start at 1 to interrupt" },
+        {
+            "- foo\n- bar\n+ baz\n",
+            "<ul>\n<li>foo</li>\n<li>bar</li>\n</ul>\n<ul>\n<li>baz</li>\n</ul>\n",
+            "bullet change starts a list",
+        },
+        {
+            "1. foo\n2. bar\n3) baz\n",
+            "<ol>\n<li>foo</li>\n<li>bar</li>\n</ol>\n<ol start=\"3\">\n<li>baz</li>\n</ol>\n",
+            "ordered",
+        },
+        {
+            "- foo\n\n- bar\n",
+            "<ul>\n<li>\n<p>foo</p>\n</li>\n<li>\n<p>bar</p>\n</li>\n</ul>\n",
+            "loose",
+        },
+        {
+            "- a\n  - b\n    - c\n",
+            "<ul>\n<li>a\n<ul>\n<li>b\n<ul>\n<li>c</li>\n</ul>\n</li>\n</ul>\n</li>\n</ul>\n",
+            "nested",
+        },
+        {
+            "1. a\n\n   b\n",
+            "<ol>\n<li>\n<p>a</p>\n<p>b</p>\n</li>\n</ol>\n",
+            "two paragraphs in an item",
+        },
+        {
+            "- foo\n  ```\n  bar\n  ```\n",
+            "<ul>\n<li>foo\n<pre><code>bar\n</code></pre>\n</li>\n</ul>\n",
+            "code in a tight item",
+        },
+        {
+            "The number of windows in my house is\n14.  The number of doors is 6.\n",
+            "<p>The number of windows in my house is\n14.  The number of doors is 6.</p>\n",
+            "ordered list must start at 1 to interrupt",
+        },
         { "-\n  foo\n", "<ul>\n<li>foo</li>\n</ul>\n", "item starting with a blank" },
-        { "- a\n- b\n\n- c\n", "<ul>\n<li>\n<p>a</p>\n</li>\n<li>\n<p>b</p>\n</li>\n<li>\n<p>c</p>\n</li>\n</ul>\n", "blank between items" },
+        {
+            "- a\n- b\n\n- c\n",
+            "<ul>\n<li>\n<p>a</p>\n</li>\n<li>\n<p>b</p>\n</li>\n<li>\n<p>c</p>\n</li>\n</ul>\n",
+            "blank between items",
+        },
         { "10. foo\n", "<ol start=\"10\">\n<li>foo</li>\n</ol>\n", "start number" },
         { "- foo\nbar\n", "<ul>\n<li>foo\nbar</li>\n</ul>\n", "lazy item continuation" },
     })
@@ -105,24 +174,72 @@ end
 
 local function links_test()
     check({
-        { "[link](/uri \"title\")\n", "<p><a href=\"/uri\" title=\"title\">link</a></p>\n", "inline" },
+        {
+            "[link](/uri \"title\")\n",
+            "<p><a href=\"/uri\" title=\"title\">link</a></p>\n",
+            "inline",
+        },
         { "[link]()\n", "<p><a href=\"\">link</a></p>\n", "empty destination" },
         { "[link](<foo bar>)\n", "<p><a href=\"foo%20bar\">link</a></p>\n", "pointy destination" },
-        { "[link](foo(and(bar)))\n", "<p><a href=\"foo(and(bar))\">link</a></p>\n", "balanced parens" },
+        {
+            "[link](foo(and(bar)))\n",
+            "<p><a href=\"foo(and(bar))\">link</a></p>\n",
+            "balanced parens",
+        },
         { "[link](foo\\)\\:)\n", "<p><a href=\"foo):\">link</a></p>\n", "escapes in destination" },
         { "[a](<b)c>)\n", "<p><a href=\"b)c\">a</a></p>\n", "paren inside pointy" },
-        { "[foo]: /url \"title\"\n\n[foo]\n", "<p><a href=\"/url\" title=\"title\">foo</a></p>\n", "shortcut reference" },
-        { "[foo][bar]\n\n[BAR]: /url\n", "<p><a href=\"/url\">foo</a></p>\n", "full reference, case folded" },
+        {
+            "[foo]: /url \"title\"\n\n[foo]\n",
+            "<p><a href=\"/url\" title=\"title\">foo</a></p>\n",
+            "shortcut reference",
+        },
+        {
+            "[foo][bar]\n\n[BAR]: /url\n",
+            "<p><a href=\"/url\">foo</a></p>\n",
+            "full reference, case folded",
+        },
         { "[foo][]\n\n[foo]: /url\n", "<p><a href=\"/url\">foo</a></p>\n", "collapsed reference" },
         { "[foo]\n", "<p>[foo]</p>\n", "undefined reference" },
-        { "[link *foo **bar** `#`*](/uri)\n", "<p><a href=\"/uri\">link <em>foo <strong>bar</strong> <code>#</code></em></a></p>\n", "inlines in text" },
-        { "[foo [bar](/uri)](/uri)\n", "<p>[foo <a href=\"/uri\">bar</a>](/uri)</p>\n", "no links in links" },
-        { "![foo](/url \"title\")\n", "<p><img src=\"/url\" alt=\"foo\" title=\"title\" /></p>\n", "image" },
-        { "![foo *bar*][foobar]\n\n[FOOBAR]: train.jpg\n", "<p><img src=\"train.jpg\" alt=\"foo bar\" /></p>\n", "image reference alt text" },
-        { "<http://foo.bar.baz/test?q=hello&id=22&boolean>\n", "<p><a href=\"http://foo.bar.baz/test?q=hello&amp;id=22&amp;boolean\">http://foo.bar.baz/test?q=hello&amp;id=22&amp;boolean</a></p>\n", "autolink" },
-        { "<foo@bar.example.com>\n", "<p><a href=\"mailto:foo@bar.example.com\">foo@bar.example.com</a></p>\n", "email autolink" },
-        { "Visit www.commonmark.org/help for more.\n", "<p>Visit <a href=\"http://www.commonmark.org/help\">www.commonmark.org/help</a> for more.</p>\n", "extended www autolink" },
-        { "See https://lus.dev/manual.\n", "<p>See <a href=\"https://lus.dev/manual\">https://lus.dev/manual</a>.</p>\n", "extended url autolink" },
+        {
+            "[link *foo **bar** `#`*](/uri)\n",
+            "<p><a href=\"/uri\">link <em>foo <strong>bar</strong> <code>#</code></em></a></p>\n",
+            "inlines in text",
+        },
+        {
+            "[foo [bar](/uri)](/uri)\n",
+            "<p>[foo <a href=\"/uri\">bar</a>](/uri)</p>\n",
+            "no links in links",
+        },
+        {
+            "![foo](/url \"title\")\n",
+            "<p><img src=\"/url\" alt=\"foo\" title=\"title\" /></p>\n",
+            "image",
+        },
+        {
+            "![foo *bar*][foobar]\n\n[FOOBAR]: train.jpg\n",
+            "<p><img src=\"train.jpg\" alt=\"foo bar\" /></p>\n",
+            "image reference alt text",
+        },
+        {
+            "<http://foo.bar.baz/test?q=hello&id=22&boolean>\n",
+            "<p><a href=\"http://foo.bar.baz/test?q=hello&amp;id=22&amp;boolean\">http://foo.bar.baz/test?q=hello&amp;id=22&amp;boolean</a></p>\n",
+            "autolink",
+        },
+        {
+            "<foo@bar.example.com>\n",
+            "<p><a href=\"mailto:foo@bar.example.com\">foo@bar.example.com</a></p>\n",
+            "email autolink",
+        },
+        {
+            "Visit www.commonmark.org/help for more.\n",
+            "<p>Visit <a href=\"http://www.commonmark.org/help\">www.commonmark.org/help</a> for more.</p>\n",
+            "extended www autolink",
+        },
+        {
+            "See https://lus.dev/manual.\n",
+            "<p>See <a href=\"https://lus.dev/manual\">https://lus.dev/manual</a>.</p>\n",
+            "extended url autolink",
+        },
         { "[é](/ü)\n", "<p><a href=\"/%C3%BC\">é</a></p>\n", "non-ASCII is encoded" },
     })
 end
@@ -130,11 +247,22 @@ end
 local function unsafe_links_test()
     check({
         { "[x](javascript:alert(1))\n", "<p><a href=\"\">x</a></p>\n", "javascript removed" },
-        { "<javascript:alert(1)>\n", "<p><a href=\"\">javascript:alert(1)</a></p>\n", "javascript autolink removed" },
-        { "![x](data:image/png;base64,AAAA)\n", "<p><img src=\"data:image/png;base64,AAAA\" alt=\"x\" /></p>\n", "data image kept" },
+        {
+            "<javascript:alert(1)>\n",
+            "<p><a href=\"\">javascript:alert(1)</a></p>\n",
+            "javascript autolink removed",
+        },
+        {
+            "![x](data:image/png;base64,AAAA)\n",
+            "<p><img src=\"data:image/png;base64,AAAA\" alt=\"x\" /></p>\n",
+            "data image kept",
+        },
         { "[x](data:text/html,hi)\n", "<p><a href=\"\">x</a></p>\n", "data link removed" },
     })
-    assert(markdown.render("[x](javascript:go)", { unsafe_links = true }) == "<p><a href=\"javascript:go\">x</a></p>\n")
+    assert(
+        markdown.render("[x](javascript:go)", { unsafe_links = true })
+            == "<p><a href=\"javascript:go\">x</a></p>\n"
+    )
 end
 
 local function html_test()
@@ -144,8 +272,16 @@ local function html_test()
     })
     check({
         { "<div>\n*hi*\n</div>\n", "<div>\n*hi*\n</div>\n", "block kept" },
-        { "a <b class=\"x\">bold</b> <!-- c -->\n", "<p>a <b class=\"x\">bold</b> <!-- c --></p>\n", "inline kept" },
-        { "<script>\nalert(1)\n\n</script>\nafter\n", "<script>\nalert(1)\n\n</script>\n<p>after</p>\n", "script block" },
+        {
+            "a <b class=\"x\">bold</b> <!-- c -->\n",
+            "<p>a <b class=\"x\">bold</b> <!-- c --></p>\n",
+            "inline kept",
+        },
+        {
+            "<script>\nalert(1)\n\n</script>\nafter\n",
+            "<script>\nalert(1)\n\n</script>\n<p>after</p>\n",
+            "script block",
+        },
     }, { html = true })
 end
 
@@ -153,10 +289,17 @@ local function entities_and_escapes_test()
     check({
         -- Named references outside the decoding table pass through for the
         -- browser to resolve.
-        { "&nbsp; &amp; &copy; &#35; &#x22; &rarr;\n", "<p>\u{A0} &amp; © # &quot; &rarr;</p>\n", "entities" },
+        {
+            "&nbsp; &amp; &copy; &#35; &#x22; &rarr;\n",
+            "<p>\u{A0} &amp; © # &quot; &rarr;</p>\n",
+            "entities",
+        },
         { "&#0; & x&y\n", "<p>\u{FFFD} &amp; x&amp;y</p>\n", "invalid references" },
-        { [=[\!\"\#\$\%\&\'\(\)\*\+\,\-\.\/\:\;\<\=\>\?\@\[\\\]\^\_\`\{\|\}\~]=] .. "\n",
-          "<p>!&quot;#$%&amp;'()*+,-./:;&lt;=&gt;?@[\\]^_`{|}~</p>\n", "every escape" },
+        {
+            [=[\!\"\#\$\%\&\'\(\)\*\+\,\-\.\/\:\;\<\=\>\?\@\[\\\]\^\_\`\{\|\}\~]=] .. "\n",
+            "<p>!&quot;#$%&amp;'()*+,-./:;&lt;=&gt;?@[\\]^_`{|}~</p>\n",
+            "every escape",
+        },
         { "\\a\\\n", "<p>\\a\\</p>\n", "not escapes" },
         { "5 < 6 & \"q\"\n", "<p>5 &lt; 6 &amp; &quot;q&quot;</p>\n", "special characters" },
     })
@@ -164,21 +307,41 @@ end
 
 local function tables_test()
     check({
-        { "| foo | bar |\n| --- | --- |\n| baz | bim |\n",
-          "<table>\n<thead>\n<tr>\n<th>foo</th>\n<th>bar</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>baz</td>\n<td>bim</td>\n</tr>\n</tbody>\n</table>\n", "basic table" },
-        { "| abc | defghi |\n:-: | -----------:\nbar | baz\n",
-          "<table>\n<thead>\n<tr>\n<th align=\"center\">abc</th>\n<th align=\"right\">defghi</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td align=\"center\">bar</td>\n<td align=\"right\">baz</td>\n</tr>\n</tbody>\n</table>\n", "alignment" },
-        { "| f\\|oo  |\n| ------ |\n| b `x` **im** |\n",
-          "<table>\n<thead>\n<tr>\n<th>f|oo</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>b <code>x</code> <strong>im</strong></td>\n</tr>\n</tbody>\n</table>\n", "escaped pipe and inlines" },
-        { "| abc | def |\n| --- |\n| bar |\n", "<p>| abc | def |\n| --- |\n| bar |</p>\n", "column count must match" },
-        { "| abc | def |\n| --- | --- |\n| bar |\n| bar | baz | boo |\n",
-          "<table>\n<thead>\n<tr>\n<th>abc</th>\n<th>def</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>bar</td>\n<td></td>\n</tr>\n<tr>\n<td>bar</td>\n<td>baz</td>\n</tr>\n</tbody>\n</table>\n", "short and long rows" },
+        {
+            "| foo | bar |\n| --- | --- |\n| baz | bim |\n",
+            "<table>\n<thead>\n<tr>\n<th>foo</th>\n<th>bar</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>baz</td>\n<td>bim</td>\n</tr>\n</tbody>\n</table>\n",
+            "basic table",
+        },
+        {
+            "| abc | defghi |\n:-: | -----------:\nbar | baz\n",
+            "<table>\n<thead>\n<tr>\n<th align=\"center\">abc</th>\n<th align=\"right\">defghi</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td align=\"center\">bar</td>\n<td align=\"right\">baz</td>\n</tr>\n</tbody>\n</table>\n",
+            "alignment",
+        },
+        {
+            "| f\\|oo  |\n| ------ |\n| b `x` **im** |\n",
+            "<table>\n<thead>\n<tr>\n<th>f|oo</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>b <code>x</code> <strong>im</strong></td>\n</tr>\n</tbody>\n</table>\n",
+            "escaped pipe and inlines",
+        },
+        {
+            "| abc | def |\n| --- |\n| bar |\n",
+            "<p>| abc | def |\n| --- |\n| bar |</p>\n",
+            "column count must match",
+        },
+        {
+            "| abc | def |\n| --- | --- |\n| bar |\n| bar | baz | boo |\n",
+            "<table>\n<thead>\n<tr>\n<th>abc</th>\n<th>def</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>bar</td>\n<td></td>\n</tr>\n<tr>\n<td>bar</td>\n<td>baz</td>\n</tr>\n</tbody>\n</table>\n",
+            "short and long rows",
+        },
     })
 end
 
 local function task_lists_test()
     check({
-        { "- [ ] foo\n- [x] bar\n", "<ul>\n<li><input disabled=\"\" type=\"checkbox\" /> foo</li>\n<li><input checked=\"\" disabled=\"\" type=\"checkbox\" /> bar</li>\n</ul>\n", "tasks" },
+        {
+            "- [ ] foo\n- [x] bar\n",
+            "<ul>\n<li><input disabled=\"\" type=\"checkbox\" /> foo</li>\n<li><input checked=\"\" disabled=\"\" type=\"checkbox\" /> bar</li>\n</ul>\n",
+            "tasks",
+        },
     })
     assert(markdown.render("- [x] a", { tasks = false }) == "<ul>\n<li>[x] a</li>\n</ul>\n")
 end
@@ -196,7 +359,29 @@ local function tree_test()
 end
 
 local function any_input_renders_test()
-    local samples = { "", "\n\n", "[", "*", "**", "`", "<", "&", "> ", "- ", "1.", "|", "```", "\\", "![", "[a](", "\0", "\t\tx", "# \n#", "[]: x" }
+    local samples = {
+        "",
+        "\n\n",
+        "[",
+        "*",
+        "**",
+        "`",
+        "<",
+        "&",
+        "> ",
+        "- ",
+        "1.",
+        "|",
+        "```",
+        "\\",
+        "![",
+        "[a](",
+        "\0",
+        "\t\tx",
+        "# \n#",
+        "[]: x",
+    }
+
     for _, s in ipairs(samples) do
         assert(type(markdown.render(s)) == "string", tojson(s))
     end
